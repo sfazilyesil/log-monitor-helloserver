@@ -1,0 +1,12 @@
+ version: '2'
+ services:
+   helloserver:
+      build: .
+      container_name: helloserver
+      ports:
+        - 8080:8080
+      logging:
+        driver: gelf
+        options:
+          gelf-address: udp://${LOGSTASH_HOST}:5000
+          tag: helloserver

@@ -1,0 +1,257 @@
+#!/bin/sh
+
+set -eu
+
+ARGS="$@"
+
+usage() {
+    echo "Usage:"
+    echo "scope launch [<peer> ...]"
+    echo "scope stop"
+    echo "scope command"
+    echo
+    echo "scope <peer>    is of the form <ip_address_or_fqdn>[:<port>]"
+    exit 1
+}
+
+SCRIPT_VERSION="0.17.1"
+if [ "$SCRIPT_VERSION" = "(unreleased version)" ] ; then
+    IMAGE_VERSION=latest
+else
+    IMAGE_VERSION=$SCRIPT_VERSION
+fi
+IMAGE_VERSION=${VERSION:-$IMAGE_VERSION}
+SCOPE_IMAGE_NAME=weaveworks/scope
+SCOPE_IMAGE=$SCOPE_IMAGE_NAME:$IMAGE_VERSION
+SCOPE_CONTAINER_NAME=weavescope
+SCOPE_APP_CONTAINER_NAME=weavescope-app
+IP_REGEXP="[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"
+IP_ADDR_CMD="find /sys/class/net -type l | xargs -n1 basename | grep -vE 'docker|veth|lo' | \
+    xargs -n1 ip addr show | grep inet | awk '{ print \$2 }' | grep -oE '$IP_REGEXP'"
+WEAVESCOPE_DOCKER_ARGS=${WEAVESCOPE_DOCKER_ARGS:-}
+
+[ $# -gt 0 ] || usage
+COMMAND=$1
+shift 1
+
+check_docker_access() {
+
+    # Extract socket path
+    DOCKER_SOCK_FILE=""
+    if [ -z "${DOCKER_HOST+x}" ]; then
+        DOCKER_SOCK_FILE="/var/run/docker.sock"
+    else
+        WITHOUT_PREFIX="${DOCKER_HOST#unix://}"
+        if [ "$WITHOUT_PREFIX" != "$DOCKER_HOST" ]; then
+            DOCKER_SOCK_FILE="$WITHOUT_PREFIX"
+        fi
+    fi
+
+    if [ \( -n "$DOCKER_SOCK_FILE" \) -a \( ! -w "$DOCKER_SOCK_FILE" \) ]; then
+        echo "ERROR: cannot write to docker socket: $DOCKER_SOCK_FILE" >&2
+        echo "change socket permissions or try using sudo" >&2
+        exit 1
+    fi
+}
+
+# - The image embeds the weave script & Docker 1.3.1 client
+# - Docker versions prior to 1.5.0 do not support --pid=host
+# - Weave needs 1.6.0 now (image pulling changes)
+MIN_DOCKER_VERSION=1.6.0
+
+check_docker_version() {
+    if ! DOCKER_VERSION=$(docker -v | sed -n 's%^Docker version \([0-9]\{1,\}\.[0-9]\{1,\}\.[0-9]\{1,\}\).*$%\1%p') ||
+       [ -z "$DOCKER_VERSION" ] ; then
+        echo "ERROR: Unable to parse docker version" >&2
+        exit 1
+    fi
+
+    DOCKER_VERSION_MAJOR=$(echo "$DOCKER_VERSION" | cut -d. -f 1)
+    DOCKER_VERSION_MINOR=$(echo "$DOCKER_VERSION" | cut -d. -f 2)
+    DOCKER_VERSION_PATCH=$(echo "$DOCKER_VERSION" | cut -d. -f 3)
+
+    MIN_DOCKER_VERSION_MAJOR=$(echo "$MIN_DOCKER_VERSION" | cut -d. -f 1)
+    MIN_DOCKER_VERSION_MINOR=$(echo "$MIN_DOCKER_VERSION" | cut -d. -f 2)
+    MIN_DOCKER_VERSION_PATCH=$(echo "$MIN_DOCKER_VERSION" | cut -d. -f 3)
+
+    if [ \( "$DOCKER_VERSION_MAJOR" -lt "$MIN_DOCKER_VERSION_MAJOR" \) -o \
+        \( "$DOCKER_VERSION_MAJOR" -eq "$MIN_DOCKER_VERSION_MAJOR" -a \
+        \( "$DOCKER_VERSION_MINOR" -lt "$MIN_DOCKER_VERSION_MINOR" -o \
+        \( "$DOCKER_VERSION_MINOR" -eq "$MIN_DOCKER_VERSION_MINOR" -a \
+        \( "$DOCKER_VERSION_PATCH" -lt "$MIN_DOCKER_VERSION_PATCH" \) \) \) \) ] ; then
+        echo "ERROR: scope requires Docker version $MIN_DOCKER_VERSION or later; you are running $DOCKER_VERSION" >&2
+        exit 1
+    fi
+}
+
+check_probe_only() {
+  echo "${ARGS}" | grep -q -E "\-\-no\-app|\-\-service\-token|\-\-probe\-only"
+}
+
+check_docker_for_mac() {
+  [ "$(uname)" = "Darwin" ] \
+    && [ -S /var/run/docker.sock ] \
+    && [ ! "${DOCKER_HOST+x}" = x ] \
+    && [ "${HOME+x}" = x ] \
+    && [ -d "${HOME}/Library/Containers/com.docker.docker/Data/database" ]
+}
+
+# Check that a container named $1 with image $2 is not running
+check_not_running() {
+    case $(docker inspect --format='{{.State.Running}} {{.Config.Image}}' $1 2>/dev/null) in
+        "true $2")
+            echo "$1 is already running." >&2
+            exit 1
+            ;;
+        "true $2:"*)
+            echo "$1 is already running." >&2
+            exit 1
+            ;;
+        "false $2")
+            docker rm $1 >/dev/null
+            ;;
+        "false $2:"*)
+            docker rm $1 >/dev/null
+            ;;
+        true*)
+            echo "Found another running container named '$1'. Aborting." >&2
+            exit 1
+            ;;
+        false*)
+            echo "Found another container named '$1'. Aborting." >&2
+            exit 1
+            ;;
+    esac
+}
+
+create_plugins_dir() {
+   # Docker for Mac (as of beta18) looks for this path on VM first, and when it doesn't
+   # find it there, it assumes the user referes to the path on Mac OS. Firstly, in most
+   # cases user won't have /var/run/scope/plugins on their Mac OS filesystem, and
+   # secondly Docker for Mac would have to be configured to share this path. The result
+   # of this "feature" is an error message: "The path /var/run/scope/plugins
+   # is not shared from OS X and does not belong to the system."
+   # In any case, creating /var/run/scope/plugins on Mac OS would not work, as domain
+   # sockets do not cross VM boundaries. We need this directory to exits on the VM.
+   docker run --rm --entrypoint=/bin/sh \
+            -v /var/run:/var/run \
+            $SCOPE_IMAGE -c "mkdir -p /var/run/scope/plugins"
+}
+
+launch_command() {
+    echo docker run --privileged -d --name=$SCOPE_CONTAINER_NAME --net=host --pid=host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /var/run/scope/plugins:/var/run/scope/plugins \
+            -e CHECKPOINT_DISABLE \
+            $WEAVESCOPE_DOCKER_ARGS $SCOPE_IMAGE --probe.docker=true "$@"
+}
+
+launch_docker4mac_app_command() {
+    echo docker run -d --name=$SCOPE_APP_CONTAINER_NAME \
+            -e CHECKPOINT_DISABLE \
+            -p 0.0.0.0:4040:4040 \
+            $WEAVESCOPE_DOCKER_ARGS $SCOPE_IMAGE --no-probe "$@"
+}
+
+launch() {
+    check_not_running $SCOPE_CONTAINER_NAME $SCOPE_IMAGE_NAME
+    docker rm -f $SCOPE_CONTAINER_NAME >/dev/null 2>&1 || true
+    CONTAINER=$($(launch_command "$@"))
+    echo $CONTAINER
+}
+
+print_app_endpoints() {
+    echo "Weave Scope is reachable at the following URL(s):" >&2
+    for ip in "$@"; do
+        echo "  * http://$ip:4040/" >&2
+    done
+}
+
+check_docker_access
+check_docker_version
+
+case "$COMMAND" in
+    command)
+        launch_command "$@"
+        ;;
+
+    version)
+        docker run --rm -e CHECKPOINT_DISABLE --entrypoint=/home/weave/scope \
+            $WEAVESCOPE_DOCKER_ARGS $SCOPE_IMAGE --mode=version
+        ;;
+
+    help)
+        cat >&2 <<EOF
+Usage:
+
+scope help     - Print this
+
+scope launch   - Launch Scope
+EOF
+        docker run --rm -e CHECKPOINT_DISABLE --entrypoint=/home/weave/scope \
+            $WEAVESCOPE_DOCKER_ARGS $SCOPE_IMAGE -h
+
+        cat >&2 <<EOF
+
+scope stop     - Stop Scope
+
+scope command  - Print the docker command used to start Scope
+
+EOF
+        ;;
+
+    launch)
+        # Do a dry run of scope in the foreground, so it can parse args etc
+        # avoiding the entrypoint script in the process.
+        docker run --rm -e CHECKPOINT_DISABLE --entrypoint=/home/weave/scope \
+            $WEAVESCOPE_DOCKER_ARGS $SCOPE_IMAGE --dry-run $@
+
+        if check_docker_for_mac ; then
+            create_plugins_dir
+            if check_probe_only ; then
+                launch "$@"
+                exit
+            fi
+            # Docker for Mac (as of beta9) does not ship vmnet driver and
+            # thereby only access container ports via a tunnel, preventing
+            # access to host ports of the VM.
+            # - https://github.com/weaveworks/scope/issues/1411
+            # - https://forums.docker.com/t/ports-in-host-network-namespace-are-not-accessible/10789
+            check_not_running $SCOPE_APP_CONTAINER_NAME $SCOPE_IMAGE_NAME
+            check_not_running $SCOPE_CONTAINER_NAME $SCOPE_IMAGE_NAME
+            docker rm -f $SCOPE_APP_CONTAINER_NAME >/dev/null 2>&1 || true
+            CONTAINER=$($(launch_docker4mac_app_command "$@"))
+            echo $CONTAINER
+            app_ip=$(docker inspect -f '{{.NetworkSettings.IPAddress}}' "${CONTAINER}")
+            docker rm -f $SCOPE_CONTAINER_NAME >/dev/null 2>&1 || true
+            CONTAINER=$($(launch_command --no-app "$@" "${app_ip}:4040"))
+            print_app_endpoints "localhost"
+            exit
+        fi
+
+        launch "$@"
+        if ! check_probe_only ; then
+            IP_ADDRS=$(docker run --rm --net=host --entrypoint /bin/sh $SCOPE_IMAGE -c "$IP_ADDR_CMD")
+            print_app_endpoints $IP_ADDRS
+        fi
+
+        ;;
+
+    stop)
+        [ $# -eq 0 ] || usage
+        if docker inspect $SCOPE_CONTAINER_NAME >/dev/null 2>&1 ; then
+           docker stop $SCOPE_CONTAINER_NAME >/dev/null
+        fi
+        if check_docker_for_mac ; then
+            if docker inspect $SCOPE_APP_CONTAINER_NAME >/dev/null 2>&1 ; then
+		docker stop $SCOPE_APP_CONTAINER_NAME >/dev/null
+            fi
+        fi
+        ;;
+
+    *)
+        echo "Unknown scope command '$COMMAND'" >&2
+        usage
+        ;;
+
+esac

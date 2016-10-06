@@ -1,0 +1,9 @@
+
+#idea files
+.idea/
+
+# binary file
+helloserver
+
+#log data
+log/log-data/
